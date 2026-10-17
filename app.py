@@ -31,18 +31,39 @@ with st.sidebar:
         help="اختر البيانات التجريبية للاختبار أو الاتصال الحي الحقيقي بحسابك."
     )
 
-    # حقل نصي مخفي لمفتاح API الخاص بإلدورادو
-    eldorado_api_key = st.text_input(
-        "Eldorado API Key / Bearer Token",
-        type="password",
-        help="أدخل مفتاح API أو الـ Bearer Token الخاص بحسابك على Eldorado.gg لجلب الطلبات الحقيقية."
+    # طريقة المصادقة
+    auth_method = st.selectbox(
+        "طريقة المصادقة مع إلدورادو:",
+        ["Client ID & Client Secret (الموصى به من إلدورادو)", "Bearer Access Token يدوي"],
+        help="إلدورادو تعتمد نظام Client ID و Client Secret لتوليد توكن مؤقت تلقائياً."
     )
+
+    if auth_method == "Client ID & Client Secret (الموصى به من إلدورادو)":
+        eldorado_client_id = st.text_input(
+            "Client ID",
+            placeholder="مثال: 632ddc0c-bf1a-49cd-...",
+            help="معرف العميل الموجود في جدول Active API client credentials في حسابك بإلدورادو."
+        )
+        eldorado_client_secret = st.text_input(
+            "Client Secret",
+            type="password",
+            help="الرمز السري الذي نسخته عند الضغط على Generate credentials."
+        )
+        eldorado_api_key = ""
+    else:
+        eldorado_client_id = ""
+        eldorado_client_secret = ""
+        eldorado_api_key = st.text_input(
+            "Eldorado Bearer Access Token",
+            type="password",
+            help="أدخل الـ Access Token المؤقت مباشرة إذا قمت بتوليده بنفسك."
+        )
     
     # خيار لتحديد رابط نقطة نهاية API الحقيقية
     with st.expander("🌐 إعدادات نقطة نهاية API (متقدم)"):
         eldorado_api_endpoint = st.text_input(
             "رابط نقطة النهاية (Orders Endpoint)",
-            value="https://eldorado.gg/api/orders",
+            value="https://www.eldorado.gg/api/orders/me",
             help="عنوان API الخاص بجلب الطلبات للبائع من منصة إلدورادو"
         )
 
@@ -221,19 +242,65 @@ def send_discord_alert(event_type: str, order_data: dict):
 
 
 # ---------------------------------------------------------
+# دالة استخراج Access Token تلقائياً من إلدورادو
+# ---------------------------------------------------------
+def get_eldorado_access_token(client_id: str, client_secret: str) -> tuple[str | None, str]:
+    """
+    استخراج Access Token مؤقت من إلدورادو باستخدام Client ID و Client Secret
+    مع تخزينه في الجلسة وتجديده تلقائياً قبل انتهاء الـ 15 دقيقة
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    # استخدام التوكن المحفوظ إذا كان لا يزال سارياً
+    if "eldorado_token" in st.session_state and "token_expires_at" in st.session_state:
+        if now < st.session_state["token_expires_at"] and st.session_state["eldorado_token"]:
+            return st.session_state["eldorado_token"], "التوكن سارٍ."
+
+    token_url = "https://www.eldorado.gg/api/authentication/seller/token"
+    payload = {
+        "clientId": client_id.strip(),
+        "clientSecret": client_secret.strip()
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "EldoradoSellerDashboard/1.0"
+    }
+    try:
+        res = requests.post(token_url, json=payload, headers=headers, timeout=12)
+        if res.status_code == 200:
+            data = res.json()
+            token = data.get("accessToken")
+            expires_in = data.get("expiresIn", 900)
+            st.session_state["eldorado_token"] = token
+            # تجديد التوكن قبل دقيقة من انتهائه
+            st.session_state["token_expires_at"] = now + datetime.timedelta(seconds=max(expires_in - 60, 60))
+            return token, "تم استخراج Access Token جديد بنجاح!"
+        elif res.status_code == 401:
+            return None, "خطأ 401: بيانات Client ID أو Client Secret غير صحيحة في إلدورادو."
+        else:
+            return None, f"فشل استخراج التوكن: كود {res.status_code} - {res.text[:150]}"
+    except Exception as e:
+        return None, f"خطأ اتصال أثناء استخراج التوكن: {str(e)}"
+
+
+# ---------------------------------------------------------
 # 4. نظام جلب البيانات (Data Fetching)
 # ---------------------------------------------------------
-def fetch_orders(api_key: str, mode: str = "بيانات تجريبية (Demo)", endpoint: str = "https://eldorado.gg/api/orders") -> tuple[pd.DataFrame, str]:
+def fetch_orders(
+    client_id: str = "",
+    client_secret: str = "",
+    api_key: str = "",
+    mode: str = "بيانات تجريبية (Demo)",
+    endpoint: str = "https://www.eldorado.gg/api/orders/me"
+) -> tuple[pd.DataFrame, str]:
     """
     جلب بيانات المبيعات والطلبات الخاصة بالبائع
-    إذا لم يتوفر مفتاح API أو كان الوضع تجريبياً يتم إرجاع بيانات وهمية (Mock Data)
-    أما في حالة الاتصال الحي، يتم التواصل الفعلي مع الـ API ومعالجة الاستجابة
+    إذا كان الوضع تجريبياً يتم إرجاع بيانات وهمية (Mock Data)
+    أما في حالة الاتصال الحي، يتم التواصل الفعلي مع الـ API إما بالتوكن المباشر أو عبر Client ID/Secret
     :return: tuple (pd.DataFrame, message)
     """
-    if mode == "بيانات تجريبية (Demo)" or not api_key or not api_key.strip():
+    if mode == "بيانات تجريبية (Demo)":
         # =====================================================================
         # بيانات وهمية (Mock Data) مطابقة لهيكل بيانات إلدورادو
-        # الأعمدة: (رقم الطلب، التاريخ، اللعبة/المنتج، الحالة، السعر ($)، صافي الربح ($))
         # =====================================================================
         mock_data = {
             "رقم الطلب": [
@@ -270,21 +337,32 @@ def fetch_orders(api_key: str, mode: str = "بيانات تجريبية (Demo)",
 
     # =========================================================================
     # [الاتصال الحي الحقيقي بـ API إلدورادو]
-    # Real Eldorado API Live Connection
     # =========================================================================
+    active_bearer_token = ""
+
+    # إذا تم توفير Client ID و Client Secret نقوم باستخراج التوكن تلقائياً
+    if client_id and client_id.strip() and client_secret and client_secret.strip():
+        token, token_msg = get_eldorado_access_token(client_id, client_secret)
+        if not token:
+            return pd.DataFrame(), token_msg
+        active_bearer_token = token
+    elif api_key and api_key.strip():
+        active_bearer_token = api_key.strip()
+    else:
+        return pd.DataFrame(), "يرجى إدخال Client ID و Client Secret أو Bearer Token في القائمة الجانبية."
+
     headers = {
-        "Authorization": f"Bearer {api_key.strip()}",
+        "Authorization": f"Bearer {active_bearer_token}",
         "Accept": "application/json",
         "User-Agent": "EldoradoSellerDashboard/1.0"
     }
     
-    target_url = endpoint.strip() if endpoint and endpoint.strip() else "https://eldorado.gg/api/orders"
+    target_url = endpoint.strip() if endpoint and endpoint.strip() else "https://www.eldorado.gg/api/orders/me"
     
     try:
         response = requests.get(target_url, headers=headers, timeout=12)
         if response.status_code == 200:
             json_data = response.json()
-            # التعامل مع أشكال الاستجابات المحتملة من الـ API (قائمة مباشرة أو قاموس يحتوي على مفتاح)
             items = []
             if isinstance(json_data, list):
                 items = json_data
@@ -307,7 +385,7 @@ def fetch_orders(api_key: str, mode: str = "بيانات تجريبية (Demo)",
                 empty_df = pd.DataFrame(columns=["رقم الطلب", "التاريخ", "اللعبة/المنتج", "الحالة", "السعر ($)", "صافي الربح ($)"])
                 return empty_df, "تم الاتصال بنجاح ولكن لا توجد أي طلبات مسجلة في هذا الحساب حالياً."
         elif response.status_code == 401:
-            return pd.DataFrame(), "خطأ 401: مفتاح API أو Bearer Token غير صالح أو انتهت صلاحيته."
+            return pd.DataFrame(), "خطأ 401: انتهت صلاحية Access Token أو مفتاح API غير صالح."
         elif response.status_code == 403:
             return pd.DataFrame(), "خطأ 403: ليس لديك الصلاحية الكافية للوصول إلى نقطة النهاية هذه."
         elif response.status_code == 404:
@@ -336,8 +414,9 @@ with col_header3:
     if st.button("🔄 تحديث يدوي الآن", use_container_width=True):
         st.rerun()
 
-# التحقق من شرط العرض: إذا تم إدخال مفتاح API أو اختيار وضع الاتصال أو تم الضغط على زر "عرض ببيانات تجريبية"
-should_display = bool(eldorado_api_key and eldorado_api_key.strip()) or st.session_state.show_demo_data or (data_source_mode == "بيانات تجريبية (Demo)")
+# التحقق من شرط العرض: إذا تم إدخال مفتاح API أو Client ID/Secret أو اختيار وضع الاتصال أو تم الضغط على زر "عرض ببيانات تجريبية"
+has_creds = bool(eldorado_api_key and eldorado_api_key.strip()) or bool(eldorado_client_id and eldorado_client_secret)
+should_display = has_creds or st.session_state.show_demo_data or (data_source_mode == "بيانات تجريبية (Demo)")
 
 # إعداد الـ Fragment للتحديث التلقائي
 fragment_interval = f"{refresh_seconds}s" if auto_refresh_enabled else None
@@ -352,11 +431,13 @@ def render_dashboard_fragment():
         st.caption(f"⚪ التحديث التلقائي غير مفعل | آخر قراءة: `{current_time_str}`")
 
     if not should_display:
-        st.info("ℹ️ لعرض المؤشرات والبيانات، يرجى إدخال Eldorado API Key في القائمة الجانبية أو الضغط على زر **'عرض ببيانات تجريبية'** بالأعلى.")
+        st.info("ℹ️ لعرض المؤشرات والبيانات، يرجى إدخال بيانات الربط في القائمة الجانبية أو الضغط على زر **'عرض ببيانات تجريبية'** بالأعلى.")
         return
 
     # جلب البيانات
     df, status_msg = fetch_orders(
+        client_id=eldorado_client_id,
+        client_secret=eldorado_client_secret,
         api_key=eldorado_api_key,
         mode=data_source_mode,
         endpoint=eldorado_api_endpoint
